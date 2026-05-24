@@ -2931,7 +2931,7 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
         int ksize;
     };
     std::vector<WnEntry> wn_entries;
-    std::vector<std::string> alpha_names; // for snake1d inv_alpha precompute
+    std::vector<std::string> alpha_names; // for snake1d alpha + inv_alpha precompute
     std::vector<std::string> sr_names;    // "vae.dec.sr_cond.<b>"
 
     // layer.0: depthwise k=7, groups=feat_dim=64
@@ -2990,7 +2990,7 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
                           /*out_ch*/ 1, /*in_ch*/ Cc_in, /*ksize*/ 7});
 
     // Sum tensor overhead — generous, will be exact once we count
-    const size_t n_tensors_estimate = wn_entries.size() + alpha_names.size() + 2 * sr_names.size() + 16;
+    const size_t n_tensors_estimate = 2 * wn_entries.size() + 2 * alpha_names.size() + 2 * sr_names.size() + 16;
     const size_t meta_size = ggml_tensor_overhead() * n_tensors_estimate;
 
     ggml_init_params ip = {
@@ -3030,6 +3030,18 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
         }
         ggml_set_name(t, e.key.c_str());
         M[e.key] = t;
+
+        auto it_b = T.find(e.key + ".bias");
+        if (it_b != T.end() && it_b->second) {
+            int C = (int)ggml_nelements(it_b->second);
+            ggml_tensor* b = ggml_new_tensor_1d(ctx->vae_wn_ggml_ctx, GGML_TYPE_F32, C);
+            if (!b) {
+                return false;
+            }
+            std::string bias_key = e.key + ".bias";
+            ggml_set_name(b, bias_key.c_str());
+            M[bias_key] = b;
+        }
     }
 
     for (const auto& name : alpha_names) {
@@ -3037,12 +3049,18 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
         if (it == T.end() || !it->second)
             continue;
         int C = (int)ggml_nelements(it->second);
-        ggml_tensor* t = ggml_new_tensor_1d(ctx->vae_wn_ggml_ctx, GGML_TYPE_F32, C);
-        if (!t)
+        ggml_tensor* alpha = ggml_new_tensor_1d(ctx->vae_wn_ggml_ctx, GGML_TYPE_F32, C);
+        if (!alpha)
+            return false;
+        ggml_set_name(alpha, name.c_str());
+        M[name] = alpha;
+
+        ggml_tensor* inv = ggml_new_tensor_1d(ctx->vae_wn_ggml_ctx, GGML_TYPE_F32, C);
+        if (!inv)
             return false;
         std::string key = name + ".inv";
-        ggml_set_name(t, key.c_str());
-        M[key] = t;
+        ggml_set_name(inv, key.c_str());
+        M[key] = inv;
     }
 
     for (const auto& sr_pfx : sr_names) {
@@ -3096,11 +3114,20 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
         }
         std::vector<float> w = wn_reconstruct(g, v, e.out_ch, e.in_ch, e.ksize);
         ggml_backend_tensor_set(M[e.key], w.data(), 0, w.size() * sizeof(float));
+
+        auto it_b = T.find(e.key + ".bias");
+        auto it_dst = M.find(e.key + ".bias");
+        if (it_b != T.end() && it_b->second && it_dst != M.end()) {
+            const float* bias = vae_tensor_f32(T, e.key + ".bias");
+            if (bias) {
+                ggml_backend_tensor_set(it_dst->second, bias, 0, ggml_nbytes(it_dst->second));
+            }
+        }
     }
 
-    // Snake1d inv_alpha = 1 / (α + 1e-9) per channel (matches Python's
-    // (alpha + 1e-9).reciprocal() semantics — including for tiny α the
-    // legacy CPU path silently rewrote as 1.0).
+    // Keep both alpha and inv_alpha in the same backend buffer as the graph
+    // weights. CUDA graph compute cannot safely mix CPU shadow constants into
+    // cublas-driven nodes.
     for (const auto& name : alpha_names) {
         auto it = T.find(name);
         if (it == T.end() || !it->second)
@@ -3111,6 +3138,7 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
         for (int i = 0; i < C; i++) {
             inv[i] = 1.0f / (a[i] + 1e-9f);
         }
+        ggml_backend_tensor_set(M[name], a, 0, ggml_nbytes(M[name]));
         ggml_backend_tensor_set(M[name + ".inv"], inv.data(), 0, inv.size() * sizeof(float));
     }
 
@@ -3228,12 +3256,10 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
         return it == M.end() ? nullptr : it->second;
     };
     auto Bias = [&](const std::string& prefix) -> ggml_tensor* {
-        auto it = Tens.find(prefix + ".bias");
-        return (it == Tens.end()) ? nullptr : it->second;
+        return Wget(prefix + ".bias");
     };
     auto Alpha = [&](const std::string& prefix) -> ggml_tensor* {
-        auto it = Tens.find(prefix + ".alpha");
-        return (it == Tens.end()) ? nullptr : it->second;
+        return Wget(prefix + ".alpha");
     };
     auto InvAlpha = [&](const std::string& prefix) -> ggml_tensor* { return Wget(prefix + ".alpha.inv"); };
 
@@ -3424,10 +3450,12 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
     if (n_patches == 0)
         return {};
 
-    if (vox_env_bool("VOXCPM2_USE_GRAPH") && !vox_backend_is_cuda(ctx)) {
+    if (vox_env_bool("VOXCPM2_USE_GRAPH") && (!vox_backend_is_cuda(ctx) || vox_env_bool("VOXCPM2_CUDA_VAE_GRAPH"))) {
         return vae_decode_graph(ctx, patches);
     } else if (vox_env_bool("VOXCPM2_USE_GRAPH") && vox_backend_is_cuda(ctx) && ctx->verbosity >= 1) {
-        fprintf(stderr, "voxcpm2: CUDA VAE graph disabled; using CPU VAE decode shadow path\n");
+        fprintf(stderr,
+                "voxcpm2: CUDA VAE graph available; set VOXCPM2_CUDA_VAE_GRAPH=1 for full CUDA VAE decode "
+                "(using CPU VAE shadow path by default)\n");
     }
 
     int feat_dim = 64;
