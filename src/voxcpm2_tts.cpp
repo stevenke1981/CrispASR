@@ -5078,6 +5078,20 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
                 fprintf(stderr, "voxcpm2: best backend unavailable, falling back to CPU\n");
             }
             ctx->backend = ctx->backend_cpu;
+        } else if (!ggml_backend_is_cpu(ctx->backend)) {
+            const char* be_name = ggml_backend_name(ctx->backend);
+            const bool is_metal = be_name && std::strstr(be_name, "Metal") != nullptr;
+            if (!is_metal) {
+                if (params.verbosity >= 1) {
+                    fprintf(stderr,
+                            "voxcpm2: backend %s is not safe for this runtime yet; falling back to CPU "
+                            "(legacy paths still read tensor->data)\n",
+                            be_name ? be_name : "(unknown)");
+                }
+                ggml_backend_free(ctx->backend);
+                ctx->backend = ctx->backend_cpu;
+                ctx->use_gpu = false;
+            }
         }
     } else {
         ctx->backend = ctx->backend_cpu;
