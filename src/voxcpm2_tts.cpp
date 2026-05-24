@@ -297,6 +297,7 @@ using crispasr::core::torch_normal_fill_16;
 struct voxcpm2_context {
     vox_hparams hp;
     vox_weights weights;
+    vox_weights weights_cpu;
     vox_tokenizer tokenizer;
     vox_kv_cache tslm_kv;
     vox_kv_cache ralm_kv;
@@ -305,6 +306,10 @@ struct voxcpm2_context {
     ggml_context* ggml_ctx = nullptr;
     ggml_backend_buffer_t weight_buf = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
+    ggml_context* ggml_ctx_cpu = nullptr;
+    ggml_backend_buffer_t weight_buf_cpu = nullptr;
+    std::map<std::string, ggml_tensor*> tensors_cpu;
+    bool has_cpu_shadow = false;
 
     // Runtime params
     int n_threads = 4;
@@ -319,11 +324,9 @@ struct voxcpm2_context {
     // RNG for CFM noise generation (seeded per synthesis call)
     mt19937_state rng;
 
-    // VOXCPM2_USE_GRAPH backend pool. Init unconditionally so the gate
-    // can be flipped per-call without re-loading the model. Weights still
-    // live on backend_cpu (legacy CPU paths read them directly via
-    // tensor->data); the graph paths run on this same CPU backend, gaining
-    // amortised graph build/alloc and ggml's planner.
+    // VOXCPM2_USE_GRAPH backend pool. GPU runs use backend-resident weights
+    // for graphified paths and a CPU shadow copy for remaining legacy paths
+    // that still read tensor->data.
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     std::vector<uint8_t> compute_meta;
@@ -410,6 +413,22 @@ struct voxcpm2_context {
                                  // copied into the backend tensor for this
                                  // synthesis call.
 };
+
+static const vox_weights& vox_cpu_weights(const voxcpm2_context* ctx) {
+    return ctx->has_cpu_shadow ? ctx->weights_cpu : ctx->weights;
+}
+
+static const std::map<std::string, ggml_tensor*>& vox_read_tensors(const voxcpm2_context* ctx) {
+    return ctx->has_cpu_shadow ? ctx->tensors_cpu : ctx->tensors;
+}
+
+static bool vox_backend_is_cuda(const voxcpm2_context* ctx) {
+    if (!ctx || !ctx->backend) {
+        return false;
+    }
+    const char* name = ggml_backend_name(ctx->backend);
+    return name && (std::strstr(name, "CUDA") || std::strstr(name, "cuda"));
+}
 
 // Stream struct
 struct voxcpm2_stream {
@@ -751,7 +770,8 @@ static void bidir_attn_full(const float* x_in, int T, int d, ggml_tensor* q_w, g
 
 static void tslm_layer_step(voxcpm2_context* ctx, int layer, float* hidden, int pos, ggml_backend_t cpu_be) {
     const vox_hparams& hp = ctx->hp;
-    const vox_lm_layer& L = ctx->weights.tslm_layers[layer];
+    const vox_weights& W = vox_cpu_weights(ctx);
+    const vox_lm_layer& L = W.tslm_layers[layer];
     int d = (int)hp.tslm_d_model;
     int n_q = (int)hp.tslm_n_heads;
     int n_kv = (int)hp.tslm_n_kv;
@@ -767,7 +787,7 @@ static void tslm_layer_step(voxcpm2_context* ctx, int layer, float* hidden, int 
     matmul_mv(cpu_be, L.attn_k_w, normed.data(), d, k.data(), n_kv * hd);
     matmul_mv(cpu_be, L.attn_v_w, normed.data(), d, v.data(), n_kv * hd);
 
-    const float* tslm_rope_sf = ctx->weights.tslm_rope_short ? tensor_data_f32(ctx->weights.tslm_rope_short) : nullptr;
+    const float* tslm_rope_sf = W.tslm_rope_short ? tensor_data_f32(W.tslm_rope_short) : nullptr;
     rope_apply_cpu(q.data(), hd, n_q, pos, hp.tslm_rope_theta, (int)hp.tslm_max_pos, tslm_rope_sf);
     rope_apply_cpu(k.data(), hd, n_kv, pos, hp.tslm_rope_theta, (int)hp.tslm_max_pos, tslm_rope_sf);
 
@@ -790,7 +810,7 @@ static void tslm_layer_step(voxcpm2_context* ctx, int layer, float* hidden, int 
 
 static void ralm_layer_step(voxcpm2_context* ctx, int layer, float* hidden, ggml_backend_t cpu_be) {
     const vox_hparams& hp = ctx->hp;
-    const vox_lm_layer& L = ctx->weights.ralm_layers[layer];
+    const vox_lm_layer& L = vox_cpu_weights(ctx).ralm_layers[layer];
     int d = (int)hp.ralm_d_model;
     int n_q = (int)hp.ralm_n_heads;
     int n_kv = (int)hp.ralm_n_kv;
@@ -1165,6 +1185,7 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
 static std::vector<float> tslm_prefill(voxcpm2_context* ctx, const std::vector<int32_t>& token_ids,
                                        ggml_backend_t cpu_be) {
     const vox_hparams& hp = ctx->hp;
+    const vox_weights& W = vox_cpu_weights(ctx);
     int d = (int)hp.tslm_d_model;
     int T = (int)token_ids.size();
     ctx->tslm_kv.reset();
@@ -1175,7 +1196,7 @@ static std::vector<float> tslm_prefill(voxcpm2_context* ctx, const std::vector<i
         int id = token_ids[t];
         if (id < 0 || id >= (int)hp.n_vocab)
             id = 0;
-        get_row_f32(ctx->weights.tslm_token_embd, id, hidden.data());
+        get_row_f32(W.tslm_token_embd, id, hidden.data());
 
         for (int l = 0; l < (int)hp.tslm_n_layers; l++) {
             tslm_layer_step(ctx, l, hidden.data(), t, cpu_be);
@@ -1204,6 +1225,7 @@ struct tslm_prefill_hooks {
 static std::vector<float> tslm_prefill_ex(voxcpm2_context* ctx, const std::vector<int32_t>& token_ids,
                                           ggml_backend_t cpu_be, const tslm_prefill_hooks& hooks) {
     const vox_hparams& hp = ctx->hp;
+    const vox_weights& W = vox_cpu_weights(ctx);
     int d = (int)hp.tslm_d_model;
     int T = (int)token_ids.size();
     int n_layers = (int)hp.tslm_n_layers;
@@ -1215,7 +1237,7 @@ static std::vector<float> tslm_prefill_ex(voxcpm2_context* ctx, const std::vecto
         int id = token_ids[t];
         if (id < 0 || id >= (int)hp.n_vocab)
             id = 0;
-        get_row_f32(ctx->weights.tslm_token_embd, id, hidden.data());
+        get_row_f32(W.tslm_token_embd, id, hidden.data());
 
         for (int l = 0; l < n_layers; l++) {
             tslm_layer_step(ctx, l, hidden.data(), t, cpu_be);
@@ -1329,7 +1351,7 @@ static std::vector<float> ralm_prefill_multi(voxcpm2_context* ctx, const float* 
 // ---------------------------------------------------------------------------
 
 static std::vector<float> fsq_forward(voxcpm2_context* ctx, const float* x, ggml_backend_t cpu_be) {
-    const vox_weights& W = ctx->weights;
+    const vox_weights& W = vox_cpu_weights(ctx);
     int d_in = 2048;
     int d_mid = 512;
     int d_out = 2048;
@@ -1354,7 +1376,7 @@ static std::vector<float> fsq_forward(voxcpm2_context* ctx, const float* x, ggml
 
 static std::vector<float> locenc_forward(voxcpm2_context* ctx, const float* patch, ggml_backend_t cpu_be) {
     const vox_hparams& hp = ctx->hp;
-    const vox_weights& W = ctx->weights;
+    const vox_weights& W = vox_cpu_weights(ctx);
     int d = (int)hp.locenc_d_model; // 1024
     int n_q = (int)hp.locenc_n_heads;
     int n_kv = (int)hp.locenc_n_kv;
@@ -1726,7 +1748,7 @@ static std::vector<float> sinusoidal_time_emb(float t_scalar, int dim) {
 static std::vector<float> locdit_forward(voxcpm2_context* ctx, const float* x_raw, const float* mu, float t_scalar,
                                          const float* cond_raw, float dt_scalar, ggml_backend_t cpu_be) {
     const vox_hparams& hp = ctx->hp;
-    const vox_weights& W = ctx->weights;
+    const vox_weights& W = vox_cpu_weights(ctx);
     int d = (int)hp.locdit_d_model; // 1024
     int n_q = (int)hp.locdit_n_heads;
     int n_kv = (int)hp.locdit_n_kv;
@@ -2324,7 +2346,7 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
 // ---------------------------------------------------------------------------
 
 static float stop_score(voxcpm2_context* ctx, const float* lm_hidden, ggml_backend_t cpu_be) {
-    const vox_weights& W = ctx->weights;
+    const vox_weights& W = vox_cpu_weights(ctx);
     if (!W.stop_proj_w || !W.stop_proj_b)
         return 0.0f;
     int d_lm = (int)ctx->hp.tslm_d_model; // 2048
@@ -2699,7 +2721,7 @@ static int vae_tensor_dim(const std::map<std::string, ggml_tensor*>& tensors, co
 // ---------------------------------------------------------------------------
 static void vae_residual_unit(voxcpm2_context* ctx, const std::string& prefix, const float* x_in, float* x_out, int C,
                               int T, int dilation) {
-    const auto& tensors = ctx->tensors;
+    const auto& tensors = vox_read_tensors(ctx);
     // snake0 (.0.alpha)
     std::vector<float> h1((size_t)C * T);
     const float* alpha0 = vae_tensor_f32(tensors, prefix + ".0.alpha");
@@ -2891,7 +2913,7 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
         return false;
     }
 
-    const auto& T = ctx->tensors;
+    const auto& T = vox_read_tensors(ctx);
     // Bail if VAE weights aren't loaded.
     if (T.find("vae.dec.layer.0.weight_g") == T.end()) {
         return false;
@@ -3146,7 +3168,7 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     if (n_patches == 0)
         return {};
 
-    const auto& Tens = ctx->tensors;
+    const auto& Tens = vox_read_tensors(ctx);
     bool have_vae = (vae_tensor_f32(Tens, "vae.dec.layer.0.weight_g") != nullptr);
     if (!have_vae) {
         // Same graceful-silence fallback as the legacy path.
@@ -3402,8 +3424,10 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
     if (n_patches == 0)
         return {};
 
-    if (vox_env_bool("VOXCPM2_USE_GRAPH")) {
+    if (vox_env_bool("VOXCPM2_USE_GRAPH") && !vox_backend_is_cuda(ctx)) {
         return vae_decode_graph(ctx, patches);
+    } else if (vox_env_bool("VOXCPM2_USE_GRAPH") && vox_backend_is_cuda(ctx) && ctx->verbosity >= 1) {
+        fprintf(stderr, "voxcpm2: CUDA VAE graph disabled; using CPU VAE decode shadow path\n");
     }
 
     int feat_dim = 64;
@@ -3420,7 +3444,7 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
     // Channel progression after each upsample block: 2048->1024->512->256->128->64->32
     static const int block_out_ch[] = {1024, 512, 256, 128, 64, 32};
 
-    const auto& T = ctx->tensors;
+    const auto& T = vox_read_tensors(ctx);
 
     // Check if VAE weights exist -- look for the first input conv weight
     bool have_vae = (vae_tensor_f32(T, "vae.dec.layer.0.weight_g") != nullptr);
@@ -3762,7 +3786,7 @@ static void vae_strided_conv1d(const float* weight, const float* bias, const flo
 // which simplifies to T_in / s for all the rates we use).
 static int vae_enc_block(voxcpm2_context* ctx, int blk_idx, int in_ch, int out_ch, int stride, const float* x_in,
                          std::vector<float>& x_out, int T_in) {
-    const auto& T = ctx->tensors;
+    const auto& T = vox_read_tensors(ctx);
     std::string blk = "vae.enc.blk." + std::to_string(blk_idx);
 
     // 3 residual units (depthwise, dilation 1, 3, 9) — reuses vae_residual_unit
@@ -3846,7 +3870,7 @@ static std::vector<float> vae_encode(voxcpm2_context* ctx, const float* pcm, int
 
 static std::vector<float> vae_encode_uncached(voxcpm2_context* ctx, const float* pcm, int n_samples,
                                               int* out_T_patches) {
-    const auto& T = ctx->tensors;
+    const auto& T = vox_read_tensors(ctx);
     const auto& hp = ctx->hp;
 
     if (out_T_patches) {
@@ -4548,6 +4572,32 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
     return true;
 }
 
+static bool vox_load_cpu_shadow_weights(voxcpm2_context* ctx, const char* path) {
+    if (!ctx || !path || !ctx->backend_cpu) {
+        return false;
+    }
+
+    voxcpm2_context shadow;
+    shadow.backend = ctx->backend_cpu;
+    shadow.backend_cpu = ctx->backend_cpu;
+    shadow.n_threads = ctx->n_threads;
+    shadow.verbosity = 0;
+
+    if (!vox_load_weights(&shadow, path)) {
+        return false;
+    }
+
+    ctx->weights_cpu = std::move(shadow.weights);
+    ctx->tensors_cpu = std::move(shadow.tensors);
+    ctx->ggml_ctx_cpu = shadow.ggml_ctx;
+    ctx->weight_buf_cpu = shadow.weight_buf;
+    ctx->has_cpu_shadow = true;
+
+    shadow.ggml_ctx = nullptr;
+    shadow.weight_buf = nullptr;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Shared prefill input builder — used by both `vox_synthesize_internal` and
 // the cloning-aware diff stage handlers. Encapsulates `_make_ref_prefix` +
@@ -4611,6 +4661,7 @@ static vox_prefill_inputs build_prefill_inputs_impl(voxcpm2_context* ctx, const 
                                                     ggml_backend_t cpu_be) {
     vox_prefill_inputs out;
     const auto& hp = ctx->hp;
+    const vox_weights& Wcpu = vox_cpu_weights(ctx);
     int d_tslm = (int)hp.tslm_d_model;
     int d_dit = (int)hp.locdit_d_model;
     int P_frames = (int)hp.patch_frames;
@@ -4666,8 +4717,8 @@ static vox_prefill_inputs build_prefill_inputs_impl(voxcpm2_context* ctx, const 
             const float* patch = out.ref_feat.data() + (size_t)patch_idx * P_frames * feat_dim_vae;
             std::vector<float> enc_out =
                 use_graph ? locenc_forward_graph(ctx, patch) : locenc_forward(ctx, patch, cpu_be);
-            if (ctx->weights.enc_to_lm_w && ctx->weights.enc_to_lm_b) {
-                matmul_mv_bias(cpu_be, ctx->weights.enc_to_lm_w, ctx->weights.enc_to_lm_b, enc_out.data(), d_dit,
+            if (Wcpu.enc_to_lm_w && Wcpu.enc_to_lm_b) {
+                matmul_mv_bias(cpu_be, Wcpu.enc_to_lm_w, Wcpu.enc_to_lm_b, enc_out.data(), d_dit,
                                out.feat_embed_pos.data() + (size_t)t * d_tslm, d_tslm);
             } else {
                 int copy_d = std::min(d_dit, d_tslm);
@@ -4681,7 +4732,7 @@ static vox_prefill_inputs build_prefill_inputs_impl(voxcpm2_context* ctx, const 
             if (id < 0 || id >= (int)hp.n_vocab) {
                 id = 0;
             }
-            get_row_f32(ctx->weights.tslm_token_embd, id, out.combined_embed.data() + (size_t)t * d_tslm);
+            get_row_f32(Wcpu.tslm_token_embd, id, out.combined_embed.data() + (size_t)t * d_tslm);
         }
     }
     return out;
@@ -4707,6 +4758,7 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
 
     double t0_total = vox_now_ms();
     const auto& hp = ctx->hp;
+    const vox_weights& Wcpu = vox_cpu_weights(ctx);
     int d_tslm = (int)hp.tslm_d_model;
     int d_dit = (int)hp.locdit_d_model;
     int P_frames = (int)hp.patch_frames;
@@ -4738,7 +4790,7 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     // 5. Apply TSLM output norm per position.
     std::vector<float> normed_all((size_t)N_pos * d_tslm);
     for (int i = 0; i < N_pos; i++) {
-        rms_norm_cpu(all_pos.data() + (size_t)i * d_tslm, tensor_data_f32(ctx->weights.tslm_output_norm),
+        rms_norm_cpu(all_pos.data() + (size_t)i * d_tslm, tensor_data_f32(Wcpu.tslm_output_norm),
                      normed_all.data() + (size_t)i * d_tslm, d_tslm, hp.rms_norm_eps);
     }
     // 5b. FSQ masking — Python:
@@ -4774,13 +4826,13 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
                 std::memcpy(cat_buf.data() + d_tslm, feat_embed_pos.data() + (size_t)i * d_tslm,
                             (size_t)d_tslm * sizeof(float));
             }
-            matmul_mv_bias(cpu_be, ctx->weights.fusion_w, ctx->weights.fusion_b, cat_buf.data(), in_dim,
+            matmul_mv_bias(cpu_be, Wcpu.fusion_w, Wcpu.fusion_b, cat_buf.data(), in_dim,
                            ralm_input.data() + (size_t)i * d_tslm, d_tslm);
         }
         std::vector<float> ralm_out = ralm_prefill_multi(ctx, ralm_input.data(), N_pos, cpu_be);
         int dr = (int)hp.ralm_d_model;
         ralm_hidden.resize(dr);
-        rms_norm_cpu(ralm_out.data() + (size_t)(N_pos - 1) * dr, tensor_data_f32(ctx->weights.ralm_output_norm),
+        rms_norm_cpu(ralm_out.data() + (size_t)(N_pos - 1) * dr, tensor_data_f32(Wcpu.ralm_output_norm),
                      ralm_hidden.data(), dr, hp.rms_norm_eps);
     }
 
@@ -4795,13 +4847,13 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     auto build_mu = [&](const std::vector<float>& lm_h, const std::vector<float>& ralm_h) -> std::vector<float> {
         std::vector<float> mu(d_mu, 0.0f);
         // First half: lm_to_dit projection [d_lm → d_dit]
-        if (ctx->weights.lm_to_dit_w && ctx->weights.lm_to_dit_b) {
-            matmul_mv_bias(cpu_be, ctx->weights.lm_to_dit_w, ctx->weights.lm_to_dit_b, lm_h.data(), d_lm, mu.data(),
+        if (Wcpu.lm_to_dit_w && Wcpu.lm_to_dit_b) {
+            matmul_mv_bias(cpu_be, Wcpu.lm_to_dit_w, Wcpu.lm_to_dit_b, lm_h.data(), d_lm, mu.data(),
                            d_dit);
         }
         // Second half: res_to_dit projection [d_ralm → d_dit]
-        if (ctx->weights.res_to_dit_w && ctx->weights.res_to_dit_b) {
-            matmul_mv_bias(cpu_be, ctx->weights.res_to_dit_w, ctx->weights.res_to_dit_b, ralm_h.data(), d_ralm,
+        if (Wcpu.res_to_dit_w && Wcpu.res_to_dit_b) {
+            matmul_mv_bias(cpu_be, Wcpu.res_to_dit_w, Wcpu.res_to_dit_b, ralm_h.data(), d_ralm,
                            mu.data() + d_dit, d_dit);
         }
         return mu;
@@ -4874,8 +4926,8 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         // 1d. enc_to_lm projection
         tb = bench ? vox_now_ms() : 0;
         std::vector<float> enc_lm(d_lm, 0.0f);
-        if (ctx->weights.enc_to_lm_w && ctx->weights.enc_to_lm_b) {
-            matmul_mv_bias(cpu_be, ctx->weights.enc_to_lm_w, ctx->weights.enc_to_lm_b, enc_out.data(), d_dit,
+        if (Wcpu.enc_to_lm_w && Wcpu.enc_to_lm_b) {
+            matmul_mv_bias(cpu_be, Wcpu.enc_to_lm_w, Wcpu.enc_to_lm_b, enc_out.data(), d_dit,
                            enc_lm.data(), d_lm);
         } else {
             int copy_d = std::min(d_dit, d_lm);
@@ -4928,7 +4980,7 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
                     tslm_layer_step(ctx, l, h.data(), tslm_pos, cpu_be);
                 }
                 std::vector<float> normed(d_lm);
-                rms_norm_cpu(h.data(), tensor_data_f32(ctx->weights.tslm_output_norm), normed.data(), d_lm,
+                rms_norm_cpu(h.data(), tensor_data_f32(Wcpu.tslm_output_norm), normed.data(), d_lm,
                              ctx->hp.rms_norm_eps);
                 tslm_hidden = normed;
             }
@@ -4950,8 +5002,8 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         std::memcpy(fusion_in.data() + d_lm, enc_lm.data(), (size_t)d_lm * sizeof(float));
 
         std::vector<float> fusion_out(d_ralm, 0.0f);
-        if (ctx->weights.fusion_w && ctx->weights.fusion_b) {
-            matmul_mv_bias(cpu_be, ctx->weights.fusion_w, ctx->weights.fusion_b, fusion_in.data(), 2 * d_lm,
+        if (Wcpu.fusion_w && Wcpu.fusion_b) {
+            matmul_mv_bias(cpu_be, Wcpu.fusion_w, Wcpu.fusion_b, fusion_in.data(), 2 * d_lm,
                            fusion_out.data(), d_ralm);
         } else {
             fusion_out = fsq_out;
@@ -4969,7 +5021,7 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
             ctx->ralm_kv.n_past++;
 
             std::vector<float> normed(d_ralm);
-            rms_norm_cpu(h.data(), tensor_data_f32(ctx->weights.ralm_output_norm), normed.data(), d_ralm,
+            rms_norm_cpu(h.data(), tensor_data_f32(Wcpu.ralm_output_norm), normed.data(), d_ralm,
                          ctx->hp.rms_norm_eps);
             ralm_hidden = normed;
         }
@@ -5056,15 +5108,9 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
     ctx->max_len = params.max_len > 0 ? params.max_len : 2000;
     ctx->seed = params.seed;
 
-    // Backend pool. With `use_gpu`, init_best picks Metal on Apple Silicon
-    // (the only relevant target for now — CUDA/Vulkan are untested for
-    // this backend). On Apple Silicon, Metal allocates in unified-memory
-    // "shared" mode, so `tensor->data` stays CPU-readable and the
-    // remaining legacy `matmul_mv_ggml` paths (TSLM/RALM prefill, LocEnc,
-    // VAE encode/decode, FSQ, stop) keep working against the same
-    // weight pointers the graph paths use. On non-shared Metal (rare on
-    // M-series) or discrete GPUs the legacy paths would SIGSEGV — we'd
-    // need to graph-ify them first; for now fall back to CPU there.
+    // Backend pool. With `use_gpu`, init_best may pick a discrete CUDA
+    // backend. VoxCPM2 is still hybrid: graphified paths read the backend
+    // weights, while legacy CPU paths read a CPU shadow copy loaded below.
     ctx->backend_cpu = get_cpu_backend();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "voxcpm2: failed to init CPU backend\n");
@@ -5080,17 +5126,9 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
             ctx->backend = ctx->backend_cpu;
         } else if (!ggml_backend_is_cpu(ctx->backend)) {
             const char* be_name = ggml_backend_name(ctx->backend);
-            const bool is_metal = be_name && std::strstr(be_name, "Metal") != nullptr;
-            if (!is_metal) {
-                if (params.verbosity >= 1) {
-                    fprintf(stderr,
-                            "voxcpm2: backend %s is not safe for this runtime yet; falling back to CPU "
-                            "(legacy paths still read tensor->data)\n",
-                            be_name ? be_name : "(unknown)");
-                }
-                ggml_backend_free(ctx->backend);
-                ctx->backend = ctx->backend_cpu;
-                ctx->use_gpu = false;
+            if (params.verbosity >= 1) {
+                fprintf(stderr, "voxcpm2: backend %s selected; loading CPU shadow for legacy paths\n",
+                        be_name ? be_name : "(unknown)");
             }
         }
     } else {
@@ -5101,6 +5139,17 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
         fprintf(stderr, "voxcpm2: failed to load '%s'\n", path_model);
         voxcpm2_free(ctx);
         return nullptr;
+    }
+
+    if (ctx->backend && !ggml_backend_is_cpu(ctx->backend)) {
+        if (!vox_load_cpu_shadow_weights(ctx, path_model)) {
+            fprintf(stderr, "voxcpm2: failed to load CPU shadow weights for hybrid GPU runtime\n");
+            voxcpm2_free(ctx);
+            return nullptr;
+        }
+        if (params.verbosity >= 1) {
+            fprintf(stderr, "voxcpm2: CPU shadow weights ready for legacy paths\n");
+        }
     }
 
     // Generous arena: ~9 nodes/layer × 12 LocDiT layers + I/O ≈ 130 nodes;
@@ -5182,6 +5231,14 @@ void voxcpm2_free(struct voxcpm2_context* ctx) {
     if (ctx->ggml_ctx) {
         ggml_free(ctx->ggml_ctx);
         ctx->ggml_ctx = nullptr;
+    }
+    if (ctx->weight_buf_cpu) {
+        ggml_backend_buffer_free(ctx->weight_buf_cpu);
+        ctx->weight_buf_cpu = nullptr;
+    }
+    if (ctx->ggml_ctx_cpu) {
+        ggml_free(ctx->ggml_ctx_cpu);
+        ctx->ggml_ctx_cpu = nullptr;
     }
     // backend_cpu is the global g_cpu_backend — process-wide, do not free.
     // backend can be a per-context Metal handle (from init_best); free that.
@@ -5278,6 +5335,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
     if (ggml_backend_is_cpu(cpu_be)) {
         ggml_backend_cpu_set_n_threads(cpu_be, ctx->n_threads);
     }
+    const vox_weights& Wcpu = vox_cpu_weights(ctx);
 
     std::string stage(stage_name);
     std::vector<int32_t> token_ids = vox_tokenize(ctx->tokenizer, std::string(text));
@@ -5341,7 +5399,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
             int N = (int)(all_pos.size() / d);
             std::vector<float> normed((size_t)N * d);
             for (int i = 0; i < N; i++) {
-                rms_norm_cpu(all_pos.data() + (size_t)i * d, tensor_data_f32(ctx->weights.tslm_output_norm),
+                rms_norm_cpu(all_pos.data() + (size_t)i * d, tensor_data_f32(Wcpu.tslm_output_norm),
                              normed.data() + (size_t)i * d, d, ctx->hp.rms_norm_eps);
             }
             if (use_ref) {
@@ -5409,7 +5467,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         int N = (int)(all_pos.size() / d);
         std::vector<float> normed((size_t)N * d);
         for (int i = 0; i < N; i++) {
-            rms_norm_cpu(all_pos.data() + (size_t)i * d, tensor_data_f32(ctx->weights.tslm_output_norm),
+            rms_norm_cpu(all_pos.data() + (size_t)i * d, tensor_data_f32(Wcpu.tslm_output_norm),
                          normed.data() + (size_t)i * d, d, ctx->hp.rms_norm_eps);
         }
         if (use_ref) {
@@ -5430,13 +5488,13 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
             if (use_ref && i < (int)audio_mask_ref.size() && audio_mask_ref[i]) {
                 std::memcpy(cat_buf.data() + d, feat_embed_ref.data() + (size_t)i * d, (size_t)d * sizeof(float));
             }
-            matmul_mv_bias(cpu_be, ctx->weights.fusion_w, ctx->weights.fusion_b, cat_buf.data(), in_dim,
+            matmul_mv_bias(cpu_be, Wcpu.fusion_w, Wcpu.fusion_b, cat_buf.data(), in_dim,
                            ralm_input.data() + (size_t)i * d, d);
         }
 
         std::vector<float> ralm_out = ralm_prefill_multi(ctx, ralm_input.data(), N, cpu_be);
         for (int i = 0; i < N; i++) {
-            rms_norm_cpu(ralm_out.data() + (size_t)i * d, tensor_data_f32(ctx->weights.ralm_output_norm),
+            rms_norm_cpu(ralm_out.data() + (size_t)i * d, tensor_data_f32(Wcpu.ralm_output_norm),
                          ralm_out.data() + (size_t)i * d, d, ctx->hp.rms_norm_eps);
         }
 
@@ -5562,7 +5620,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
             std::vector<float> tslm_h = tslm_prefill(ctx, token_ids, cpu_be);
             {
                 std::vector<float> normed(d);
-                rms_norm_cpu(tslm_h.data(), tensor_data_f32(ctx->weights.tslm_output_norm), normed.data(), d,
+                rms_norm_cpu(tslm_h.data(), tensor_data_f32(Wcpu.tslm_output_norm), normed.data(), d,
                              ctx->hp.rms_norm_eps);
                 tslm_h = normed;
             }
@@ -5570,20 +5628,20 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
             std::vector<float> cat_buf(in_dim, 0.0f);
             std::memcpy(cat_buf.data(), tslm_h.data(), (size_t)d * sizeof(float));
             std::vector<float> ralm_input(d);
-            matmul_mv_bias(cpu_be, ctx->weights.fusion_w, ctx->weights.fusion_b, cat_buf.data(), in_dim,
+            matmul_mv_bias(cpu_be, Wcpu.fusion_w, Wcpu.fusion_b, cat_buf.data(), in_dim,
                            ralm_input.data(), d);
             std::vector<float> ralm_h = ralm_prefill(ctx, ralm_input, cpu_be);
             {
                 std::vector<float> normed(d_ralm);
-                rms_norm_cpu(ralm_h.data(), tensor_data_f32(ctx->weights.ralm_output_norm), normed.data(), d_ralm,
+                rms_norm_cpu(ralm_h.data(), tensor_data_f32(Wcpu.ralm_output_norm), normed.data(), d_ralm,
                              ctx->hp.rms_norm_eps);
                 ralm_h = normed;
             }
-            if (ctx->weights.lm_to_dit_w && ctx->weights.lm_to_dit_b)
-                matmul_mv_bias(cpu_be, ctx->weights.lm_to_dit_w, ctx->weights.lm_to_dit_b, tslm_h.data(), d, mu.data(),
+            if (Wcpu.lm_to_dit_w && Wcpu.lm_to_dit_b)
+                matmul_mv_bias(cpu_be, Wcpu.lm_to_dit_w, Wcpu.lm_to_dit_b, tslm_h.data(), d, mu.data(),
                                d_dit);
-            if (ctx->weights.res_to_dit_w && ctx->weights.res_to_dit_b)
-                matmul_mv_bias(cpu_be, ctx->weights.res_to_dit_w, ctx->weights.res_to_dit_b, ralm_h.data(), d_ralm,
+            if (Wcpu.res_to_dit_w && Wcpu.res_to_dit_b)
+                matmul_mv_bias(cpu_be, Wcpu.res_to_dit_w, Wcpu.res_to_dit_b, ralm_h.data(), d_ralm,
                                mu.data() + d_dit, d_dit);
 
             // Use ref noise if provided (just noise, no mu)
@@ -5687,7 +5745,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         int feat_dim = 64;
         const int N_CAP = 8;
         int total = N_CAP * d_lm;
-        if (!ctx->weights.enc_to_lm_w || !ctx->weights.enc_to_lm_b) {
+        if (!Wcpu.enc_to_lm_w || !Wcpu.enc_to_lm_b) {
             return nullptr;
         }
         *out_n = total;
@@ -5709,7 +5767,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
                     patch_ptr = ref_feat.data() + (size_t)(i - 1) * P_fr * feat_dim;
                 }
                 std::vector<float> enc = locenc_forward(ctx, patch_ptr, cpu_be);
-                matmul_mv_bias(cpu_be, ctx->weights.enc_to_lm_w, ctx->weights.enc_to_lm_b, enc.data(), d_enc,
+                matmul_mv_bias(cpu_be, Wcpu.enc_to_lm_w, Wcpu.enc_to_lm_b, enc.data(), d_enc,
                                proj.data(), d_lm);
                 std::memcpy(out + (size_t)i * d_lm, proj.data(), (size_t)d_lm * sizeof(float));
             }
@@ -5718,7 +5776,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
             std::vector<float> zero_patch((size_t)feat_dim * P_fr, 0.0f);
             std::vector<float> enc_out = locenc_forward(ctx, zero_patch.data(), cpu_be);
             std::vector<float> proj_one(d_lm);
-            matmul_mv_bias(cpu_be, ctx->weights.enc_to_lm_w, ctx->weights.enc_to_lm_b, enc_out.data(), d_enc,
+            matmul_mv_bias(cpu_be, Wcpu.enc_to_lm_w, Wcpu.enc_to_lm_b, enc_out.data(), d_enc,
                            proj_one.data(), d_lm);
             for (int i = 0; i < N_CAP; i++) {
                 std::memcpy(out + (size_t)i * d_lm, proj_one.data(), (size_t)d_lm * sizeof(float));
@@ -5733,7 +5791,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         std::vector<float> h = tslm_prefill(ctx, token_ids, cpu_be);
         int d = (int)ctx->hp.tslm_d_model;
         std::vector<float> normed(d);
-        rms_norm_cpu(h.data(), tensor_data_f32(ctx->weights.tslm_output_norm), normed.data(), d, ctx->hp.rms_norm_eps);
+        rms_norm_cpu(h.data(), tensor_data_f32(Wcpu.tslm_output_norm), normed.data(), d, ctx->hp.rms_norm_eps);
         *out_n = d;
         float* out = (float*)std::malloc((size_t)d * sizeof(float));
         std::memcpy(out, normed.data(), (size_t)d * sizeof(float));
@@ -5777,7 +5835,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         // Apply output norm to each position
         std::vector<float> normed_all((size_t)N * d);
         for (int i = 0; i < N; i++) {
-            rms_norm_cpu(all_pos.data() + (size_t)i * d, tensor_data_f32(ctx->weights.tslm_output_norm),
+            rms_norm_cpu(all_pos.data() + (size_t)i * d, tensor_data_f32(Wcpu.tslm_output_norm),
                          normed_all.data() + (size_t)i * d, d, ctx->hp.rms_norm_eps);
         }
 
@@ -5805,7 +5863,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
             if (use_ref && i < (int)audio_mask_ref.size() && audio_mask_ref[i]) {
                 std::memcpy(cat_buf.data() + d, feat_embed_ref.data() + (size_t)i * d, (size_t)d * sizeof(float));
             }
-            matmul_mv_bias(cpu_be, ctx->weights.fusion_w, ctx->weights.fusion_b, cat_buf.data(), in_dim,
+            matmul_mv_bias(cpu_be, Wcpu.fusion_w, Wcpu.fusion_b, cat_buf.data(), in_dim,
                            ralm_input.data() + (size_t)i * d, d);
         }
 
@@ -5815,13 +5873,13 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         // Apply RALM output norm and extract last position
         int dr = (int)ctx->hp.ralm_d_model;
         std::vector<float> ralm_h(dr);
-        rms_norm_cpu(ralm_out.data() + (size_t)(N - 1) * dr, tensor_data_f32(ctx->weights.ralm_output_norm),
+        rms_norm_cpu(ralm_out.data() + (size_t)(N - 1) * dr, tensor_data_f32(Wcpu.ralm_output_norm),
                      ralm_h.data(), dr, ctx->hp.rms_norm_eps);
 
         if (stage == "lm_to_dit_hidden") {
-            if (ctx->weights.lm_to_dit_w && ctx->weights.lm_to_dit_b) {
+            if (Wcpu.lm_to_dit_w && Wcpu.lm_to_dit_b) {
                 std::vector<float> proj(d_dit);
-                matmul_mv_bias(cpu_be, ctx->weights.lm_to_dit_w, ctx->weights.lm_to_dit_b, tslm_out.data(), d,
+                matmul_mv_bias(cpu_be, Wcpu.lm_to_dit_w, Wcpu.lm_to_dit_b, tslm_out.data(), d,
                                proj.data(), d_dit);
                 *out_n = d_dit;
                 float* out = (float*)std::malloc((size_t)d_dit * sizeof(float));
@@ -5829,10 +5887,10 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
                 return out;
             }
         } else { // res_to_dit_hidden
-            if (ctx->weights.res_to_dit_w && ctx->weights.res_to_dit_b) {
+            if (Wcpu.res_to_dit_w && Wcpu.res_to_dit_b) {
                 int d_ralm = (int)ctx->hp.ralm_d_model;
                 std::vector<float> proj(d_dit);
-                matmul_mv_bias(cpu_be, ctx->weights.res_to_dit_w, ctx->weights.res_to_dit_b, ralm_h.data(), d_ralm,
+                matmul_mv_bias(cpu_be, Wcpu.res_to_dit_w, Wcpu.res_to_dit_b, ralm_h.data(), d_ralm,
                                proj.data(), d_dit);
                 *out_n = d_dit;
                 float* out = (float*)std::malloc((size_t)d_dit * sizeof(float));
@@ -5849,7 +5907,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         int d = (int)ctx->hp.tslm_d_model;
         {
             std::vector<float> normed(d);
-            rms_norm_cpu(h.data(), tensor_data_f32(ctx->weights.tslm_output_norm), normed.data(), d,
+            rms_norm_cpu(h.data(), tensor_data_f32(Wcpu.tslm_output_norm), normed.data(), d,
                          ctx->hp.rms_norm_eps);
             h = normed;
         }
